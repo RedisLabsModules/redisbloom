@@ -1,6 +1,16 @@
 version: 2.1
 
 commands:
+  abort_for_docs:
+    steps:
+      - run:
+          name: Avoid tests for docs
+          command: |
+            if [[ $CIRCLE_BRANCH == *_docs ]]; then
+              echo "Identifies as documents PR, no testing required"
+              circleci step halt
+            fi
+
   early_return_for_forked_pull_requests:
     description: >-
       If this build is from a fork, stop executing the current job and return success.
@@ -9,7 +19,7 @@ commands:
       - run:
           name: Early return if this build is from a forked PR
           command: |
-            if [ -n "$CIRCLE_PR_NUMBER" ]; then
+            if [[ -n "$CIRCLE_PR_NUMBER" ]]; then
               echo "Nothing to do for forked PRs, so marking this step successful"
               circleci step halt
             fi
@@ -17,14 +27,19 @@ commands:
   setup-automation:
     steps:
       - run:
-          name: Pull Submodules
-          command: git submodule update --init --recursive
-      - run:
           name: Setup automation
           command: |
-            make setup
+            git submodule update --init deps/readies
+            ./deps/readies/bin/getpy3
 
-  ci_steps:
+  checkout-all:
+    steps:
+      - checkout
+      - run:
+          name: Checkout submodules
+          command: git submodule update --init --recursive
+
+  build_steps:
     parameters:
       platform:
         type: string
@@ -38,16 +53,17 @@ commands:
         type: string
         default: ""
     steps:
-      - checkout
-      - run:
-          name: Pull Submodules
-          command: git submodule update --init --recursive
+      - abort_for_docs
+      - checkout-all
+      - setup-automation
       - run:
           name: Install prerequisites
           command: make setup
       - run:
           name: Install Redis
-          command: python3 ./deps/readies/bin/getredis -v 6 <<parameters.getredis_params>>
+          command: |
+            python3 ./deps/readies/bin/getredis -v 6 --force <<parameters.getredis_params>>
+            redis-server --version
       - run:
           name: Build
           command: make build <<parameters.build_params>> SHOW=1
@@ -64,20 +80,20 @@ jobs:
     docker:
       - image: redislabsmodules/llvm-toolset:latest
     steps:
-      - checkout
+      - abort_for_docs
+      - checkout-all
+      - setup-automation
       - run:
           name: lint
           command: |
+            make setup
             make lint
 
   static-analysis-infer:
     docker:
       - image: redisbench/infer-linux64:1.0.0
     steps:
-      - checkout
-      - run:
-          name: Submodule checkout
-          command: git submodule update --init --recursive
+      - checkout-all
       - run:
           name: run fbinfer
           command: |
@@ -85,28 +101,20 @@ jobs:
 
   valgrind:
     docker:
-      - image: redisfab/rmbuilder:6.0.9-x64-buster
+      - image: redisfab/rmbuilder:6.2.1-x64-buster
     steps:
-      - ci_steps:
+      - build_steps:
           platform: debian
           build_params: VALGRIND=1 -j
           test_params: VALGRIND=1 SIMPLE=1
-          getredis_params: --force --valgrind
+          getredis_params: --valgrind
 
   build:
     docker:
-      - image: 'redisfab/rmbuilder:6.0.9-x64-bionic'
+      - image: redisfab/rmbuilder:6.2.1-x64-buster
     steps:
-      - checkout
-      - ci_steps:
+      - build_steps:
           platform: debian
-      - run:
-          name: Coverage
-          command: |
-            apt-get update -qq
-            apt-get install -y lcov curl
-            make coverage
-            bash <(curl -s https://codecov.io/bash)
       - early_return_for_forked_pull_requests
       - run:
           name: Persist Artifacts
@@ -114,7 +122,6 @@ jobs:
             mkdir -p /workspace/build
             cp $MODULE_ARTIFACT /workspace/
             cp ramp.yml /workspace
-
       - persist_to_workspace:
           root: /workspace
           paths:
@@ -122,51 +129,28 @@ jobs:
             - ramp.yml
             - build
 
-  package_branch:
+  coverage:
     docker:
-      - image: 'redisfab/rmbuilder:6.0.9-x64-bionic'
+      - image: redisfab/rmbuilder:6.2.1-x64-buster
     steps:
-      - attach_workspace:
-          at: /workspace
+      - abort_for_docs
+      - checkout-all
       - run:
-          name: Package
+          name: Build & Test
           command: |
-            export LC_ALL=C.UTF-8
-            export LANG=C.UTF-8
-            python -m RAMP.ramp pack -m /workspace/ramp.yml -o /workspace/build/$PACKAGE_NAME.{os}-{architecture}.$CIRCLE_BRANCH.zip /workspace/$MODULE_ARTIFACT
-      - persist_to_workspace:
-          root: /workspace
-          paths:
-            - build
-      - store_artifacts:
-          path: /workspace/build
-  package_release:
-    docker:
-      - image: 'redisfab/rmbuilder:6.0.9-x64-bionic'
-    steps:
-      - attach_workspace:
-          at: /workspace
-      - run:
-          name: Package
-          command: |
-            export LC_ALL=C.UTF-8
-            export LANG=C.UTF-8
-            python -m RAMP.ramp pack -m /workspace/ramp.yml -o /workspace/build/$PACKAGE_NAME.{os}-{architecture}.{semantic_version}.zip /workspace/$MODULE_ARTIFACT
-      - run:
-          name: Package
-          command: |
-            export LC_ALL=C.UTF-8
-            export LANG=C.UTF-8
-            python -m RAMP.ramp pack -m /workspace/ramp.yml -o /workspace/build/$PACKAGE_NAME.{os}-{architecture}.latest.zip /workspace/$MODULE_ARTIFACT
-      - persist_to_workspace:
-          root: /workspace
-          paths:
-            - build
-      - store_artifacts:
-          path: /workspace/build
+            make setup
+            # make build COV=1 SHOW=1
+            # make test COV=1
+            # bash <(curl -s https://codecov.io/bash) -f bin/linux-x64-debug-cov/cov.info
+            make coverage
+            bash <(curl -s https://codecov.io/bash)
+      #- store_artifacts:
+      #    path: coverage
+      #    destination: coverage
+
   deploy_branch:
     docker:
-      - image: 'redisfab/rmbuilder:6.0.9-x64-bionic'
+      - image: redisfab/rmbuilder:6.2.1-x64-buster
     steps:
       - attach_workspace:
           at: /workspace
@@ -177,8 +161,10 @@ jobs:
             public-read --recursive --exclude "*" --include "*.zip"
   deploy_release:
     docker:
-      - image: 'redisfab/rmbuilder:6.0.9-x64-bionic'
+      - image: redisfab/rmbuilder:6.2.1-x64-buster
     steps:
+      - abort_for_docs
+      - early_return_for_forked_pull_requests
       - attach_workspace:
           at: /workspace
       - run:
@@ -189,23 +175,27 @@ jobs:
 
   release_automation:
     docker:
-      - image: redisfab/rmbuilder:6.0.9-x64-buster
+      - image: redisfab/rmbuilder:6.2.1-x64-buster
     steps:
+      - abort_for_docs
+      - early_return_for_forked_pull_requests
       - checkout
       - setup-automation
       - run:
           name: Run QA Automation
-          command: MODULE_VERSION=$CIRCLE_TAG VERBOSE=1 TEST=release ./tests/qa/run
+          command: MODULE_VERSION="$CIRCLE_TAG" VERBOSE=1 TEST=release ./tests/qa/run
 
   nightly_automation:
     docker:
-      - image: redisfab/rmbuilder:6.0.9-x64-buster
+      - image: redisfab/rmbuilder:6.2.1-x64-buster
     steps:
+      - abort_for_docs
+      - early_return_for_forked_pull_requests
       - checkout
       - setup-automation
       - run:
           name: Run QA Automation
-          command: MODULE_VERSION=$CIRCLE_BRANCH VERBOSE=1 TEST=nightly QUICK=1 ./tests/qa/run
+          command: MODULE_VERSION="$CIRCLE_BRANCH" VERBOSE=1 TEST=nightly QUICK=1 ./tests/qa/run
 
 
 on-any-branch: &on-any-branch
@@ -226,6 +216,28 @@ on-master: &on-master
   filters:
     branches:
       only: master
+    tags:
+      ignore: /.*/
+
+on-integ-branch: &on-integ-branch
+  filters:
+    branches:
+      only:
+        - master
+        - /^\d+\.\d+.*$/
+        - /^feature-.*$/
+    tags:
+      ignore: /.*/
+
+not-on-integ-branch: &not-on-integ-branch
+  filters:
+    branches:
+      ignore:
+        - master
+        - /^\d+\.\d+.*$/
+        - /^feature-.*$/
+    tags:
+      ignore: /.*/
 
 on-version-tags: &on-version-tags
   filters:
@@ -234,18 +246,20 @@ on-version-tags: &on-version-tags
     tags:
       only: /^v[0-9].*/
 
-on-master-and-version-tags: &on-master-and-version-tags
+on-integ-and-version-tags: &on-integ-and-version-tags
   filters:
     branches:
       only:
         - master
+        - /^\d+\.\d+.*$/
+        - /^feature-.*$/
     tags:
       only: /^v[0-9].*/
 
 
 workflows:
   version: 2
-  build_and_package:
+  default-flow:
     jobs:
       - lint
       - static-analysis-infer
@@ -280,6 +294,8 @@ workflows:
     triggers:
       - schedule:
           cron: "07 20 * * *"
-          <<: *on-master
+          filters:
+            branches:
+              only: master
     jobs:
       - nightly_automation
